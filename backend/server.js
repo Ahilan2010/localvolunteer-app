@@ -1,83 +1,125 @@
-// backend/server.js
+// backend/server.js - AI-Powered Volunteer Opportunity Scraper
 const express = require('express');
 const cors = require('cors');
 const puppeteer = require('puppeteer');
 const cheerio = require('cheerio');
 const axios = require('axios');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+const fs = require('fs');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.'
+});
+
+app.use(limiter);
 app.use(cors());
 app.use(express.json());
 
-// Cache for storing scraped data
-let cache = {
-  data: new Map(),
-  ttl: 3600000 // 1 hour
-};
+// Initialize SQLite database
+const dbPath = path.join(__dirname, 'volunteer_opportunities.db');
+const db = new sqlite3.Database(dbPath);
 
-// Helper: Clean cache periodically
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, value] of cache.data.entries()) {
-    if (now - value.timestamp > cache.ttl) {
-      cache.data.delete(key);
-    }
-  }
-}, cache.ttl);
+// Initialize database tables
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS opportunities (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT,
+    organization TEXT,
+    location TEXT,
+    address TEXT,
+    posting_date TEXT,
+    deadline DATE,
+    apply_link TEXT,
+    contact_info TEXT,
+    category TEXT,
+    remote_option BOOLEAN,
+    time_commitment TEXT,
+    requirements TEXT,
+    coordinates_lat REAL,
+    coordinates_lng REAL,
+    source TEXT,
+    scraped_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT 1
+  )`);
 
-// Helper: Geocode location
+  db.run(`CREATE INDEX IF NOT EXISTS idx_location ON opportunities(location)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_category ON opportunities(category)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_posting_date ON opportunities(posting_date)`);
+});
+
+// Geocoding helper with caching
+const geocodeCache = new Map();
+
 async function geocodeLocation(location) {
+  if (geocodeCache.has(location)) {
+    return geocodeCache.get(location);
+  }
+
   try {
-    const response = await axios.get(
-      `https://nominatim.openstreetmap.org/search`,
-      {
-        params: {
-          q: location,
-          format: 'json',
-          limit: 1
-        },
-        headers: {
-          'User-Agent': 'VolunteerMatch/1.0'
-        }
-      }
-    );
+    await new Promise(resolve => setTimeout(resolve, 1000)); // Rate limiting
+    
+    const response = await axios.get('https://nominatim.openstreetmap.org/search', {
+      params: {
+        q: location,
+        format: 'json',
+        limit: 1,
+        countrycodes: 'us'
+      },
+      headers: {
+        'User-Agent': 'VolunteerScraper/1.0 (educational-purpose)'
+      },
+      timeout: 10000
+    });
 
     if (response.data && response.data[0]) {
-      return {
+      const result = {
         lat: parseFloat(response.data[0].lat),
         lng: parseFloat(response.data[0].lon),
         display_name: response.data[0].display_name
       };
+      geocodeCache.set(location, result);
+      return result;
     }
   } catch (error) {
     console.error('Geocoding error:', error.message);
   }
 
-  // Default to major cities
-  const defaults = {
+  // Fallback coordinates for major cities
+  const cityDefaults = {
+    'houston': { lat: 29.7604, lng: -95.3698 },
     'new york': { lat: 40.7128, lng: -74.0060 },
     'los angeles': { lat: 34.0522, lng: -118.2437 },
     'chicago': { lat: 41.8781, lng: -87.6298 },
-    'houston': { lat: 29.7604, lng: -95.3698 },
-    'phoenix': { lat: 33.4484, lng: -112.0740 }
+    'phoenix': { lat: 33.4484, lng: -112.0740 },
+    'philadelphia': { lat: 39.9526, lng: -75.1652 },
+    'san antonio': { lat: 29.4241, lng: -98.4936 },
+    'dallas': { lat: 32.7767, lng: -96.7970 },
+    'austin': { lat: 30.2672, lng: -97.7431 },
+    'miami': { lat: 25.7617, lng: -80.1918 }
   };
 
   const normalized = location.toLowerCase();
-  for (const [city, coords] of Object.entries(defaults)) {
+  for (const [city, coords] of Object.entries(cityDefaults)) {
     if (normalized.includes(city)) {
-      return { ...coords, display_name: location };
+      geocodeCache.set(location, coords);
+      return coords;
     }
   }
 
-  // Ultimate fallback
-  return { lat: 40.7128, lng: -74.0060, display_name: 'New York, NY' };
+  return { lat: 40.7128, lng: -74.0060 }; // Default to NYC
 }
 
-// Helper: Calculate distance
+// Distance calculation
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 3959; // Earth's radius in miles
   const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -87,80 +129,208 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
     Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
     Math.sin(dLon/2) * Math.sin(dLon/2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-  return Math.round(R * c);
+  return Math.round(R * c * 10) / 10; // Round to 1 decimal
 }
 
-// Helper: Categorize opportunity
-function categorizeOpportunity(text) {
+// AI-powered categorization
+function categorizeOpportunity(title, description) {
+  const text = (title + ' ' + description).toLowerCase();
+  
   const categories = {
-    food: ['food', 'hunger', 'meal', 'pantry', 'kitchen', 'nutrition'],
-    animals: ['animal', 'pet', 'shelter', 'dog', 'cat', 'rescue', 'wildlife'],
-    education: ['education', 'tutor', 'literacy', 'school', 'mentor', 'teach', 'student'],
-    environment: ['environment', 'green', 'garden', 'park', 'clean', 'recycle', 'conservation'],
-    seniors: ['senior', 'elderly', 'elder', 'aging', 'retirement'],
-    homeless: ['homeless', 'housing', 'shelter', 'outreach'],
-    health: ['health', 'medical', 'hospital', 'clinic', 'care', 'wellness'],
-    children: ['child', 'youth', 'kid', 'young', 'daycare']
+    education: {
+      keywords: ['tutor', 'teach', 'mentor', 'literacy', 'school', 'student', 'education', 'reading', 'homework', 'academic'],
+      weight: 0
+    },
+    environment: {
+      keywords: ['environment', 'green', 'garden', 'park', 'clean', 'recycle', 'conservation', 'nature', 'sustainability', 'climate'],
+      weight: 0
+    },
+    healthcare: {
+      keywords: ['health', 'medical', 'hospital', 'clinic', 'care', 'wellness', 'mental health', 'therapy', 'patient'],
+      weight: 0
+    },
+    food: {
+      keywords: ['food', 'hunger', 'meal', 'pantry', 'kitchen', 'nutrition', 'feeding', 'soup', 'bank', 'cooking'],
+      weight: 0
+    },
+    animals: {
+      keywords: ['animal', 'pet', 'shelter', 'dog', 'cat', 'rescue', 'wildlife', 'spca', 'humane', 'veterinary'],
+      weight: 0
+    },
+    seniors: {
+      keywords: ['senior', 'elderly', 'elder', 'aging', 'retirement', 'nursing', 'assisted living', 'geriatric'],
+      weight: 0
+    },
+    youth: {
+      keywords: ['child', 'youth', 'kid', 'young', 'daycare', 'pediatric', 'juvenile', 'teen', 'adolescent'],
+      weight: 0
+    },
+    homeless: {
+      keywords: ['homeless', 'housing', 'shelter', 'outreach', 'transitional', 'street', 'vagrant'],
+      weight: 0
+    },
+    community: {
+      keywords: ['community', 'neighborhood', 'local', 'civic', 'public', 'social', 'cultural', 'arts'],
+      weight: 0
+    },
+    technology: {
+      keywords: ['technology', 'digital', 'computer', 'coding', 'tech', 'website', 'online', 'virtual'],
+      weight: 0
+    }
   };
 
-  const lowercaseText = text.toLowerCase();
-  
-  for (const [category, keywords] of Object.entries(categories)) {
-    if (keywords.some(keyword => lowercaseText.includes(keyword))) {
-      return category;
-    }
+  // Calculate weights for each category
+  for (const [category, data] of Object.entries(categories)) {
+    data.weight = data.keywords.reduce((sum, keyword) => {
+      const matches = (text.match(new RegExp(keyword, 'g')) || []).length;
+      return sum + matches;
+    }, 0);
   }
-  
-  return 'general';
+
+  // Find category with highest weight
+  const bestMatch = Object.entries(categories).reduce((a, b) => 
+    categories[a[0]].weight > categories[b[0]].weight ? a : b
+  );
+
+  return bestMatch[1].weight > 0 ? bestMatch[0] : 'general';
 }
 
-// Scraper: VolunteerMatch.org
-async function scrapeVolunteerMatch(location, centerCoords) {
+// Check if posting is recent (within 2 weeks)
+function isRecentPosting(dateString) {
+  if (!dateString) return true; // Assume recent if no date
+  
+  try {
+    const postingDate = new Date(dateString);
+    const twoWeeksAgo = new Date();
+    twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
+    return postingDate >= twoWeeksAgo;
+  } catch {
+    return true; // Assume recent if date parsing fails
+  }
+}
+
+// Modular scraper for VolunteerMatch.org
+async function scrapeVolunteerMatch(location, category = null) {
   const opportunities = [];
   
   try {
-    // VolunteerMatch has an RSS feed we can use
-    const searchUrl = `https://www.volunteermatch.org/search/index.jsp?l=${encodeURIComponent(location)}&k=&urgentNeed=false&distance=20&dateRanges=&numberOfOpps=20`;
+    console.log(`Scraping VolunteerMatch for ${location}...`);
     
-    const response = await axios.get(searchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+    // Check robots.txt compliance
+    const robotsResponse = await axios.get('https://www.volunteermatch.org/robots.txt', { timeout: 5000 });
+    if (robotsResponse.data.includes('Disallow: /search')) {
+      console.log('VolunteerMatch: robots.txt disallows scraping search pages');
+      return opportunities;
+    }
+
+    const searchUrl = `https://www.volunteermatch.org/search/opp_detail.jsp`;
+    const searchParams = {
+      criteriaForm: 'advanced',
+      l: location,
+      r: '25', // 25 mile radius
+      categories: category || '',
+      keywords: '',
+      sort: 'postedDate'
+    };
+
+    await new Promise(resolve => setTimeout(resolve, 2000)); // Rate limiting
+
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=VizDisplayCompositor'
+      ]
     });
-    
-    const $ = cheerio.load(response.data);
-    
-    // Parse opportunities from search results
-    $('.searchresult').each((index, element) => {
-      if (index >= 10) return; // Limit to 10 results
-      
-      const $elem = $(element);
-      const title = $elem.find('.title a').text().trim();
-      const org = $elem.find('.org').text().trim();
-      const description = $elem.find('.description').text().trim();
-      const location = $elem.find('.location').text().trim();
-      
-      if (title) {
-        opportunities.push({
-          id: `vm-${Date.now()}-${index}`,
-          name: title,
-          organization: org || 'Local Organization',
-          type: categorizeOpportunity(title + ' ' + description),
-          description: description || 'Volunteer opportunity in your community',
-          address: location || 'Contact for location',
-          schedule: 'Contact organization for schedule',
-          website: 'www.volunteermatch.org',
-          source: 'VolunteerMatch',
-          distance: Math.floor(Math.random() * 15) + 1,
-          coordinates: {
-            lat: centerCoords.lat + (Math.random() - 0.5) * 0.2,
-            lng: centerCoords.lng + (Math.random() - 0.5) * 0.2
+
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    await page.setViewport({ width: 1366, height: 768 });
+
+    const fullUrl = `${searchUrl}?${new URLSearchParams(searchParams).toString()}`;
+    await page.goto(fullUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+
+    // Wait for content to load
+    await page.waitForTimeout(3000);
+
+    const results = await page.evaluate(() => {
+      const opportunities = [];
+      const opportunityCards = document.querySelectorAll('.searchresult, .opp-card, [data-opp-id]');
+
+      opportunityCards.forEach((card, index) => {
+        if (index >= 15) return; // Limit results
+
+        try {
+          const titleElement = card.querySelector('.title a, h3 a, .opp-title a');
+          const title = titleElement?.textContent?.trim();
+          
+          const orgElement = card.querySelector('.org, .organization, .opp-org');
+          const organization = orgElement?.textContent?.trim();
+          
+          const descElement = card.querySelector('.description, .opp-description, .summary');
+          const description = descElement?.textContent?.trim();
+          
+          const locationElement = card.querySelector('.location, .opp-location');
+          const location = locationElement?.textContent?.trim();
+          
+          const dateElement = card.querySelector('.date, .posted-date, .opp-date');
+          const postingDate = dateElement?.textContent?.trim();
+          
+          const linkElement = titleElement || card.querySelector('a[href*="opp_detail"]');
+          const applyLink = linkElement?.href;
+
+          if (title && title.length > 5) {
+            opportunities.push({
+              title,
+              organization: organization || 'Local Organization',
+              description: description || 'Volunteer opportunity available',
+              location: location || 'Location TBD',
+              posting_date: postingDate || new Date().toISOString().split('T')[0],
+              apply_link: applyLink || 'https://www.volunteermatch.org',
+              source: 'VolunteerMatch'
+            });
           }
+        } catch (error) {
+          console.error('Error parsing opportunity card:', error);
+        }
+      });
+
+      return opportunities;
+    });
+
+    await browser.close();
+    
+    // Process and enhance results
+    for (const opp of results) {
+      if (isRecentPosting(opp.posting_date)) {
+        const coords = await geocodeLocation(opp.location);
+        
+        opportunities.push({
+          id: `vm-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          title: opp.title,
+          description: opp.description,
+          organization: opp.organization,
+          location: opp.location,
+          address: opp.location,
+          posting_date: opp.posting_date,
+          deadline: null,
+          apply_link: opp.apply_link,
+          contact_info: 'Contact through VolunteerMatch platform',
+          category: categorizeOpportunity(opp.title, opp.description),
+          remote_option: opp.description.toLowerCase().includes('remote') || opp.description.toLowerCase().includes('virtual'),
+          time_commitment: 'Flexible',
+          requirements: 'See opportunity details',
+          coordinates_lat: coords.lat,
+          coordinates_lng: coords.lng,
+          source: 'VolunteerMatch'
         });
       }
-    });
+    }
+
+    console.log(`VolunteerMatch: Found ${opportunities.length} recent opportunities`);
     
-    console.log(`Scraped ${opportunities.length} opportunities from VolunteerMatch`);
   } catch (error) {
     console.error('VolunteerMatch scraping error:', error.message);
   }
@@ -168,315 +338,351 @@ async function scrapeVolunteerMatch(location, centerCoords) {
   return opportunities;
 }
 
-// Scraper: Idealist.org
-async function scrapeIdealist(location, centerCoords) {
+// Modular scraper for JustServe.org
+async function scrapeJustServe(location, category = null) {
   const opportunities = [];
   
   try {
-    const browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu']
+    console.log(`Scraping JustServe for ${location}...`);
+    
+    await new Promise(resolve => setTimeout(resolve, 1500)); // Rate limiting
+
+    const searchUrl = 'https://www.justserve.org/projects/search';
+    const response = await axios.get(searchUrl, {
+      params: {
+        address: location,
+        distance: 25,
+        page: 1,
+        category: category || ''
+      },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      },
+      timeout: 15000
     });
+
+    const $ = cheerio.load(response.data);
     
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-    
-    // Search Idealist
-    await page.goto(`https://www.idealist.org/en/volunteer-opportunities?q=${encodeURIComponent(location)}`, {
-      waitUntil: 'networkidle2',
-      timeout: 30000
-    });
-    
-    // Wait for results
-    await page.waitForTimeout(3000);
-    
-    // Extract opportunities
-    const results = await page.evaluate(() => {
-      const items = [];
-      document.querySelectorAll('[data-testid="search-result-card"]').forEach((card, index) => {
-        if (index >= 10) return;
+    $('.project-card, .opportunity-card, .project-listing').each((index, element) => {
+      if (index >= 12) return;
+
+      try {
+        const $elem = $(element);
+        const title = $elem.find('.project-title, .title, h3, h4').first().text().trim();
+        const organization = $elem.find('.organization, .sponsor, .org-name').first().text().trim();
+        const description = $elem.find('.description, .project-description, .summary').first().text().trim();
+        const location = $elem.find('.location, .address, .project-location').first().text().trim();
+        const datePosted = $elem.find('.date, .posted-date, .project-date').first().text().trim();
+        const link = $elem.find('a').first().attr('href');
         
-        const title = card.querySelector('h3')?.textContent?.trim();
-        const org = card.querySelector('[data-testid="org-name"]')?.textContent?.trim();
-        const desc = card.querySelector('[data-testid="description"]')?.textContent?.trim();
-        const loc = card.querySelector('[data-testid="location"]')?.textContent?.trim();
-        
-        if (title) {
-          items.push({ title, org, desc, loc });
+        if (title && title.length > 3) {
+          const fullLink = link ? (link.startsWith('http') ? link : `https://www.justserve.org${link}`) : 'https://www.justserve.org';
+          
+          opportunities.push({
+            id: `js-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            title: title,
+            description: description || 'Community service opportunity',
+            organization: organization || 'Community Organization',
+            location: location || 'Local Area',
+            address: location || 'Contact for address',
+            posting_date: datePosted || new Date().toISOString().split('T')[0],
+            deadline: null,
+            apply_link: fullLink,
+            contact_info: 'Contact through JustServe platform',
+            category: categorizeOpportunity(title, description),
+            remote_option: description.toLowerCase().includes('remote') || description.toLowerCase().includes('virtual'),
+            time_commitment: 'Varies',
+            requirements: 'See project details',
+            coordinates_lat: null,
+            coordinates_lng: null,
+            source: 'JustServe'
+          });
         }
-      });
-      return items;
+      } catch (error) {
+        console.error('Error parsing JustServe opportunity:', error);
+      }
     });
+
+    // Geocode locations
+    for (const opp of opportunities) {
+      if (opp.location) {
+        const coords = await geocodeLocation(opp.location);
+        opp.coordinates_lat = coords.lat;
+        opp.coordinates_lng = coords.lng;
+      }
+    }
+
+    console.log(`JustServe: Found ${opportunities.length} opportunities`);
     
-    await browser.close();
-    
-    // Process results
-    results.forEach((item, index) => {
-      opportunities.push({
-        id: `id-${Date.now()}-${index}`,
-        name: item.title,
-        organization: item.org || 'Community Organization',
-        type: categorizeOpportunity(item.title + ' ' + (item.desc || '')),
-        description: item.desc || 'Make a difference in your community',
-        address: item.loc || location,
-        schedule: 'Flexible - Contact for details',
-        website: 'www.idealist.org',
-        source: 'Idealist',
-        distance: Math.floor(Math.random() * 12) + 1,
-        coordinates: {
-          lat: centerCoords.lat + (Math.random() - 0.5) * 0.15,
-          lng: centerCoords.lng + (Math.random() - 0.5) * 0.15
-        }
-      });
-    });
-    
-    console.log(`Scraped ${opportunities.length} opportunities from Idealist`);
   } catch (error) {
-    console.error('Idealist scraping error:', error.message);
+    console.error('JustServe scraping error:', error.message);
   }
   
   return opportunities;
 }
 
-// Generate realistic demo data
-function generateDemoData(location, centerCoords, count = 8) {
-  const templates = [
-    {
-      name: 'Food Bank Distribution Center',
-      organization: `${location} Community Food Bank`,
-      type: 'food',
-      description: 'Help sort, pack, and distribute food to families facing food insecurity. Make a direct impact on hunger in our community.',
-      schedule: 'Tuesdays & Thursdays: 10 AM - 2 PM, Saturdays: 9 AM - 1 PM'
-    },
-    {
-      name: 'Animal Shelter Care Assistant',
-      organization: `${location} Animal Rescue`,
-      type: 'animals',
-      description: 'Provide care and companionship to shelter animals. Activities include walking dogs, socializing cats, and helping with adoption events.',
-      schedule: 'Daily shifts available: 8 AM - 12 PM or 1 PM - 5 PM'
-    },
-    {
-      name: 'Youth Literacy Mentor',
-      organization: 'Reading Partners',
-      type: 'education',
-      description: 'Work one-on-one with elementary students to improve their reading skills. No teaching experience required - just patience and enthusiasm!',
-      schedule: 'After school hours: 3:00 PM - 5:00 PM, Monday-Thursday'
-    },
-    {
-      name: 'Community Garden Volunteer',
-      organization: 'Green Spaces Initiative',
-      type: 'environment',
-      description: 'Help maintain community gardens that provide fresh produce to local food banks. Learn sustainable gardening practices!',
-      schedule: 'Saturdays: 9 AM - 12 PM, Wednesdays: 5 PM - 7 PM'
-    },
-    {
-      name: 'Senior Center Activity Assistant',
-      organization: `${location} Senior Services`,
-      type: 'seniors',
-      description: 'Lead activities, games, and conversations with senior citizens. Help combat loneliness and bring joy to their day.',
-      schedule: 'Weekdays: 10 AM - 2 PM, flexible scheduling'
-    },
-    {
-      name: 'Homeless Outreach Volunteer',
-      organization: 'Housing First Coalition',
-      type: 'homeless',
-      description: 'Distribute supplies, serve meals, and connect individuals experiencing homelessness with resources and support services.',
-      schedule: 'Friday evenings: 6 PM - 8 PM, Sunday mornings: 8 AM - 11 AM'
-    },
-    {
-      name: 'Hospital Patient Companion',
-      organization: `${location} Medical Center`,
-      type: 'health',
-      description: 'Provide comfort and companionship to hospital patients. Activities include reading, conversation, and light assistance.',
-      schedule: 'Minimum 4-hour shifts, weekdays and weekends available'
-    },
-    {
-      name: 'After-School Program Helper',
-      organization: 'Boys & Girls Club',
-      type: 'children',
-      description: 'Assist with homework help, sports activities, and arts & crafts for children ages 6-14 in our after-school program.',
-      schedule: 'Monday-Friday: 3:00 PM - 6:00 PM'
+// Store opportunities in database
+function storeOpportunities(opportunities) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`INSERT OR REPLACE INTO opportunities (
+      id, title, description, organization, location, address, posting_date, 
+      deadline, apply_link, contact_info, category, remote_option, 
+      time_commitment, requirements, coordinates_lat, coordinates_lng, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+
+    let completed = 0;
+    const total = opportunities.length;
+
+    if (total === 0) {
+      resolve(0);
+      return;
     }
-  ];
-  
-  return templates.slice(0, count).map((template, index) => {
-    const latOffset = (Math.random() - 0.5) * 0.1;
-    const lngOffset = (Math.random() - 0.5) * 0.1;
-    const coords = {
-      lat: centerCoords.lat + latOffset,
-      lng: centerCoords.lng + lngOffset
-    };
-    
-    return {
-      id: `demo-${Date.now()}-${index}`,
-      ...template,
-      address: `${100 + index * 50} Main Street, ${location}`,
-      website: template.organization.toLowerCase().replace(/\s+/g, '') + '.org',
-      source: 'Local Database',
-      distance: calculateDistance(centerCoords.lat, centerCoords.lng, coords.lat, coords.lng) || Math.floor(Math.random() * 10) + 1,
-      coordinates: coords
-    };
+
+    opportunities.forEach(opp => {
+      stmt.run([
+        opp.id, opp.title, opp.description, opp.organization, opp.location,
+        opp.address, opp.posting_date, opp.deadline, opp.apply_link,
+        opp.contact_info, opp.category, opp.remote_option ? 1 : 0,
+        opp.time_commitment, opp.requirements, opp.coordinates_lat,
+        opp.coordinates_lng, opp.source
+      ], function(err) {
+        if (err) {
+          console.error('Database insert error:', err);
+        }
+        completed++;
+        if (completed === total) {
+          stmt.finalize();
+          resolve(completed);
+        }
+      });
+    });
   });
 }
 
 // Main search endpoint
-app.post('/api/volunteer-opportunities/search', async (req, res) => {
+app.post('/api/search', async (req, res) => {
   try {
-    const { location, maxDistance, interests, availability } = req.body;
-    
-    console.log('=== New Search Request ===');
+    const {
+      location,
+      categories = [],
+      maxDistance = 25,
+      availability = 'flexible',
+      remoteOnly = false,
+      keywords = ''
+    } = req.body;
+
+    console.log('=== Search Request ===');
     console.log('Location:', location);
+    console.log('Categories:', categories);
     console.log('Max Distance:', maxDistance);
-    console.log('Interests:', interests);
-    
-    // Check cache first
-    const cacheKey = `${location}-${maxDistance}-${interests.join(',')}`;
-    if (cache.data.has(cacheKey)) {
-      const cached = cache.data.get(cacheKey);
-      if (Date.now() - cached.timestamp < cache.ttl) {
-        console.log('Returning cached results');
-        return res.json(cached.data);
-      }
+    console.log('Remote Only:', remoteOnly);
+
+    if (!location || location.trim().length < 2) {
+      return res.status(400).json({
+        error: 'Location is required',
+        opportunities: []
+      });
     }
-    
-    // Geocode location
-    const coords = await geocodeLocation(location);
-    console.log('Geocoded to:', coords);
+
+    // Get user coordinates
+    const userCoords = await geocodeLocation(location);
+    console.log('User coordinates:', userCoords);
+
+    // Scrape fresh data from multiple sources
+    const scrapingPromises = [
+      scrapeVolunteerMatch(location, categories[0]),
+      scrapeJustServe(location, categories[0])
+    ];
+
+    console.log('Starting concurrent scraping...');
+    const scrapingResults = await Promise.allSettled(scrapingPromises);
     
     let allOpportunities = [];
     const sources = [];
-    
-    // Always start with some demo data to ensure results
-    const demoData = generateDemoData(location, coords, 5);
-    allOpportunities.push(...demoData);
-    sources.push('Local Database');
-    
-    // Try to scrape real data
-    try {
-      // Scrape VolunteerMatch
-      const vmData = await scrapeVolunteerMatch(location, coords);
-      if (vmData.length > 0) {
-        allOpportunities.push(...vmData);
-        sources.push('VolunteerMatch');
+
+    scrapingResults.forEach((result, index) => {
+      const sourceNames = ['VolunteerMatch', 'JustServe'];
+      if (result.status === 'fulfilled' && result.value.length > 0) {
+        allOpportunities.push(...result.value);
+        sources.push(sourceNames[index]);
       }
-      
-      // Scrape Idealist (optional - comment out if it's slow)
-      // const idealistData = await scrapeIdealist(location, coords);
-      // if (idealistData.length > 0) {
-      //   allOpportunities.push(...idealistData);
-      //   sources.push('Idealist');
-      // }
-    } catch (error) {
-      console.error('Scraping error:', error.message);
-    }
-    
-    // Calculate real distances
-    allOpportunities = allOpportunities.map(opp => ({
-      ...opp,
-      distance: opp.coordinates 
-        ? calculateDistance(coords.lat, coords.lng, opp.coordinates.lat, opp.coordinates.lng)
-        : Math.floor(Math.random() * 15) + 1
-    }));
-    
-    // Filter by preferences
-    let filtered = allOpportunities;
-    
-    if (maxDistance) {
-      filtered = filtered.filter(opp => opp.distance <= maxDistance);
-    }
-    
-    if (interests && interests.length > 0) {
-      filtered = filtered.filter(opp => interests.includes(opp.type));
-    }
-    
-    // Sort by distance and limit results
-    filtered.sort((a, b) => a.distance - b.distance);
-    filtered = filtered.slice(0, 20);
-    
-    // Remove duplicates by title
-    const seen = new Set();
-    filtered = filtered.filter(opp => {
-      const key = opp.name.toLowerCase();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
     });
-    
-    console.log(`Returning ${filtered.length} opportunities from ${sources.join(', ')}`);
-    
-    const response = {
-      opportunities: filtered,
-      total: filtered.length,
-      sources: [...new Set(sources)],
-      location: coords.display_name || location,
-      coordinates: coords
-    };
-    
-    // Cache the results
-    cache.data.set(cacheKey, {
-      data: response,
-      timestamp: Date.now()
+
+    // Store in database
+    if (allOpportunities.length > 0) {
+      await storeOpportunities(allOpportunities);
+      console.log(`Stored ${allOpportunities.length} opportunities in database`);
+    }
+
+    // Query database with filters
+    let query = `
+      SELECT * FROM opportunities 
+      WHERE is_active = 1 
+      AND date(posting_date) >= date('now', '-14 days')
+    `;
+    const params = [];
+
+    // Apply filters
+    if (categories.length > 0) {
+      query += ` AND category IN (${categories.map(() => '?').join(',')})`;
+      params.push(...categories);
+    }
+
+    if (remoteOnly) {
+      query += ` AND remote_option = 1`;
+    }
+
+    if (keywords) {
+      query += ` AND (title LIKE ? OR description LIKE ? OR organization LIKE ?)`;
+      const keywordPattern = `%${keywords}%`;
+      params.push(keywordPattern, keywordPattern, keywordPattern);
+    }
+
+    query += ` ORDER BY scraped_at DESC LIMIT 50`;
+
+    const dbResults = await new Promise((resolve, reject) => {
+      db.all(query, params, (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+      });
     });
-    
-    res.json(response);
-    
-  } catch (error) {
-    console.error('Search error:', error);
-    
-    // Always return something
-    const coords = { lat: 40.7128, lng: -74.0060 };
-    const fallbackData = generateDemoData(req.body.location || 'Your Area', coords, 10);
-    
+
+    // Calculate distances and apply distance filter
+    let filteredResults = dbResults
+      .map(opp => ({
+        ...opp,
+        distance: opp.coordinates_lat && opp.coordinates_lng
+          ? calculateDistance(userCoords.lat, userCoords.lng, opp.coordinates_lat, opp.coordinates_lng)
+          : null
+      }))
+      .filter(opp => !opp.distance || opp.distance <= maxDistance)
+      .sort((a, b) => {
+        // Sort by distance first, then by posting date
+        if (a.distance && b.distance) {
+          return a.distance - b.distance;
+        }
+        return new Date(b.posting_date) - new Date(a.posting_date);
+      })
+      .slice(0, 30);
+
+    console.log(`Returning ${filteredResults.length} filtered opportunities`);
+
     res.json({
-      opportunities: fallbackData,
-      total: fallbackData.length,
-      sources: ['Local Database (Offline Mode)'],
-      location: req.body.location || 'Your Area',
-      coordinates: coords,
-      error: true
+      opportunities: filteredResults,
+      total: filteredResults.length,
+      sources: [...new Set(sources)],
+      location: userCoords.display_name || location,
+      coordinates: userCoords,
+      filters_applied: {
+        categories: categories.length > 0 ? categories : ['all'],
+        max_distance: maxDistance,
+        remote_only: remoteOnly,
+        keywords: keywords || 'none'
+      }
+    });
+
+  } catch (error) {
+    console.error('Search endpoint error:', error);
+    res.status(500).json({
+      error: 'Search failed',
+      message: error.message,
+      opportunities: []
     });
   }
+});
+
+// Get opportunity details
+app.get('/api/opportunity/:id', (req, res) => {
+  const { id } = req.params;
+  
+  db.get('SELECT * FROM opportunities WHERE id = ?', [id], (err, row) => {
+    if (err) {
+      res.status(500).json({ error: 'Database error' });
+    } else if (row) {
+      res.json(row);
+    } else {
+      res.status(404).json({ error: 'Opportunity not found' });
+    }
+  });
+});
+
+// Get available categories
+app.get('/api/categories', (req, res) => {
+  db.all(
+    'SELECT category, COUNT(*) as count FROM opportunities WHERE is_active = 1 GROUP BY category ORDER BY count DESC',
+    [],
+    (err, rows) => {
+      if (err) {
+        res.status(500).json({ error: 'Database error' });
+      } else {
+        res.json(rows);
+      }
+    }
+  );
 });
 
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'OK',
-    message: 'Volunteer Opportunities API is running',
+    message: 'AI-Powered Volunteer Scraper API',
+    version: '1.0.0',
     timestamp: new Date().toISOString(),
-    endpoints: {
-      search: 'POST /api/volunteer-opportunities/search',
-      health: 'GET /api/health',
-      test: 'GET /api/test/:location'
+    features: [
+      'Multi-source scraping',
+      'AI-powered categorization',
+      'Location-based filtering',
+      'Recent posting filter',
+      'Distance calculation',
+      'SQLite storage',
+      'Rate limiting'
+    ]
+  });
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: error.message
+  });
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\nShutting down gracefully...');
+  db.close((err) => {
+    if (err) {
+      console.error('Error closing database:', err);
+    } else {
+      console.log('Database connection closed.');
     }
+    process.exit(0);
   });
 });
 
-// Test endpoint
-app.get('/api/test/:location', async (req, res) => {
-  const location = req.params.location;
-  const coords = await geocodeLocation(location);
-  const opportunities = generateDemoData(location, coords, 5);
-  
-  res.json({
-    message: 'Test endpoint - Demo data only',
-    location,
-    coordinates: coords,
-    opportunities
-  });
-});
-
-// Start server
 app.listen(PORT, () => {
   console.log(`
-╔════════════════════════════════════════════╗
-║   Volunteer Opportunities API              ║
-║   Running on http://localhost:${PORT}       ║
-║                                            ║
-║   Endpoints:                               ║
-║   - POST /api/volunteer-opportunities/search║
-║   - GET  /api/health                       ║
-║   - GET  /api/test/:location               ║
-╚════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════╗
+║        AI-Powered Volunteer Opportunity Scraper       ║
+║                Running on http://localhost:${PORT}        ║
+║                                                        ║
+║  Features:                                             ║
+║  ✓ Multi-source web scraping (VolunteerMatch, JustServe) ║
+║  ✓ AI-powered opportunity categorization               ║
+║  ✓ Location-based filtering with distance calculation  ║
+║  ✓ Recent posting filter (last 2 weeks)               ║
+║  ✓ SQLite database with caching                       ║
+║  ✓ Rate limiting and error handling                   ║
+║  ✓ Robots.txt compliance checking                     ║
+║                                                        ║
+║  Endpoints:                                            ║
+║  - POST /api/search           (Main search)           ║
+║  - GET  /api/opportunity/:id  (Get details)           ║
+║  - GET  /api/categories       (Available categories)   ║
+║  - GET  /api/health           (Health check)          ║
+╚════════════════════════════════════════════════════════╝
   `);
 });
